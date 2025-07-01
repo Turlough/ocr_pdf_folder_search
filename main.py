@@ -18,7 +18,7 @@ def extract_text_from_pdf(filepath, search_term):
     
     return None
 
-def scan_folder(folder, search_term):
+def scan_folder(folder, search_term, results_file):
     results = []
     # Walk through all subdirectories
     files_to_scan = []
@@ -40,15 +40,24 @@ def scan_folder(folder, search_term):
             result = future.result()
             if result:
                 results.append(result)
-    
+                with open(results_file, 'a', encoding='utf-8') as f:
+                    f.write(result + '\n')
+
     return results
 
 if __name__ == "__main__":  
     folder = input('Enter the folder to scan\n\t-> ').replace('"', '').strip()
     search_term = input('Enter the search term\n\t-> ').lower().replace('"', '').strip().encode("utf-8")
+    results_file = os.path.join(os.path.dirname(folder), f'{os.path.basename(folder)}_{search_term.decode("utf-8")}_search_results.txt')
 
-    results = scan_folder(folder, search_term)
-    print(f'Found {len(results)} results')
-    for result in results:
-        print(result)
+    results = scan_folder(folder, search_term, results_file)
+    
+    if results:
+        print(f'Found {len(results)} results')
+        for result in results:
+            print(result)
+            # They have already been saved to the file as they are found
+            print(f'Results saved to {results_file}')
+    else:
+        print('No results found')
 
