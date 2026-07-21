@@ -1,0 +1,24 @@
+[project]
+name = "ocr-pdf-folder-search"
+version = "0.2.0"
+description = "PyQt6 desktop app that OCRs the front page of scanned PDFs in a folder and searches for a term using PaddleOCR."
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+license = { file = "LICENSE" }
+dependencies = [
+    "PyQt6>=6.6",
+    "paddleocr>=2.7,<3.0",
+    "paddlepaddle>=2.6,<3.0",
+    "PyMuPDF>=1.24",
+    "numpy<2",
+    "Pillow>=10.0",
+    # paddlepaddle imports setuptools at runtime but does not declare it.
+    "setuptools>=68",
+]
+
+# No [build-system] on purpose: uv treats this as a non-packaged (virtual)
+# project, so dependencies are installed but the app is run directly via
+# `uv run main.py`.
+
+[tool.uv]
+package = false
