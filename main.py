@@ -413,6 +413,8 @@ class MainWindow(QMainWindow):
         self.text_cache: dict[str, str] = {}
         self.thread: QThread | None = None
         self.worker: SearchWorker | None = None
+        # Guards against re-rendering when a result selection syncs the file list.
+        self._syncing_selection = False
         self.concurrency = self.settings.value(
             "concurrency", DEFAULT_CONCURRENCY, type=str
         )
@@ -436,7 +438,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(4, 4, 4, 4)
         left_layout.addWidget(QLabel("PDFs"))
         self.file_list = QListWidget()
-        self.file_list.itemClicked.connect(self._on_file_clicked)
+        self.file_list.currentItemChanged.connect(self._on_file_selected)
         left_layout.addWidget(self.file_list)
 
         # Centre: front-page image display.
@@ -452,7 +454,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.addWidget(QLabel("Results"))
         self.results_list = QListWidget()
-        self.results_list.itemClicked.connect(self._on_result_clicked)
+        self.results_list.currentItemChanged.connect(self._on_result_selected)
         right_layout.addWidget(self.results_list)
 
         splitter.addWidget(left)
@@ -641,10 +643,18 @@ class MainWindow(QMainWindow):
         self.stop_action.setEnabled(False)
 
     # --------------------------------------------------------------- selection
-    def _on_file_clicked(self, item: QListWidgetItem) -> None:
+    def _on_file_selected(
+        self, item: QListWidgetItem | None, _previous: QListWidgetItem | None = None
+    ) -> None:
+        if item is None or self._syncing_selection:
+            return
         self._display_path(item.data(Qt.ItemDataRole.UserRole))
 
-    def _on_result_clicked(self, item: QListWidgetItem) -> None:
+    def _on_result_selected(
+        self, item: QListWidgetItem | None, _previous: QListWidgetItem | None = None
+    ) -> None:
+        if item is None:
+            return
         path = item.data(Qt.ItemDataRole.UserRole)
         self._select_in_file_list(path)
         self._display_path(path)
@@ -665,8 +675,14 @@ class MainWindow(QMainWindow):
         for row in range(self.file_list.count()):
             item = self.file_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == path:
-                self.file_list.setCurrentItem(item)
-                self.file_list.scrollToItem(item)
+                # Suppress the file list's own selection handler so we don't
+                # render the same page twice (the result handler renders it).
+                self._syncing_selection = True
+                try:
+                    self.file_list.setCurrentItem(item)
+                    self.file_list.scrollToItem(item)
+                finally:
+                    self._syncing_selection = False
                 break
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
