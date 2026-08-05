@@ -42,9 +42,18 @@ CONCURRENCY_GPU_BATCH = "gpu_batch"
 CONCURRENCY_EXECUTOR = "executor"
 DEFAULT_CONCURRENCY = CONCURRENCY_GPU_BATCH
 
+# OCR engine identifiers (persisted in QSettings and shown in the menu). The
+# engine is the backend that actually reads text; the concurrency setting only
+# decides how work is spread across threads/processes.
+ENGINE_PADDLE = "paddle"
+ENGINE_TESSERACT = "tesseract"
+ENGINE_RAPIDOCR = "rapidocr"
+DEFAULT_ENGINE = ENGINE_PADDLE
+VALID_ENGINES = (ENGINE_PADDLE, ENGINE_TESSERACT, ENGINE_RAPIDOCR)
+
 # GPU-batching pipeline: how many front pages to pre-render per round, and how
 # many threads to render them with (PyMuPDF rendering releases the GIL).
-OCR_BATCH_SIZE = 8
+OCR_BATCH_SIZE = 30
 RENDER_WORKERS = 4
 
 # Process-pool executor: default number of worker processes. Each worker is
@@ -52,6 +61,15 @@ RENDER_WORKERS = 4
 # scale across cores instead of oversubscribing them, which lets us run more of
 # them. Capped to keep memory (one PaddleOCR engine per process) in check.
 DEFAULT_MAX_WORKERS = min(8, os.cpu_count() or 2)
+
+# PaddleOCR/Paddle accumulate native memory across inference calls and cannot
+# return it to the OS without exiting the process. ``ProcessPoolExecutor``'s
+# ``max_tasks_per_child`` is unreliable on Windows (the pool often breaks after
+# the first generation of workers, aborting the rest of the search at exactly
+# ``workers × pages`` — e.g. 8×4 = 32). Instead we process files in chunks of
+# ``DEFAULT_MAX_WORKERS × EXECUTOR_PAGES_PER_WORKER``, fully shutting the pool
+# down between chunks so memory is reclaimed and the next chunk starts fresh.
+EXECUTOR_PAGES_PER_WORKER = 4
 
 # PaddleOCR is imported lazily inside the worker thread/processes because
 # importing it (and initialising the models) is slow and prints a lot of noise.
@@ -186,6 +204,74 @@ def _build_paddle_engine(use_gpu: bool, cpu_threads: int | None = None):
     raise RuntimeError(f"Could not initialise PaddleOCR: {last_exc}")
 
 
+# --------------------------------------------------------------- OCR backends
+# Each backend wraps one OCR engine behind a uniform ``ocr_text(array) -> str``
+# call so the concurrency strategies don't care which engine is in use. Heavy
+# third-party imports are done lazily inside ``__init__`` so a missing optional
+# dependency only fails when that engine is actually selected.
+
+
+class PaddleBackend:
+    """PaddleOCR (PP-OCR models on the PaddlePaddle runtime)."""
+
+    def __init__(self, use_gpu: bool = False, cpu_threads: int | None = None):
+        self._engine = _build_paddle_engine(use_gpu=use_gpu, cpu_threads=cpu_threads)
+
+    def ocr_text(self, array: np.ndarray) -> str:
+        result = self._engine.ocr(array, cls=True)
+        return "\n".join(texts_from_paddle_result(result))
+
+
+class TesseractBackend:
+    """Tesseract via ``pytesseract`` (needs the Tesseract binary installed)."""
+
+    def __init__(self, use_gpu: bool = False, cpu_threads: int | None = None):
+        import pytesseract  # noqa: F401 - probe availability early
+
+        self._pytesseract = pytesseract
+
+    def ocr_text(self, array: np.ndarray) -> str:
+        from PIL import Image
+
+        return self._pytesseract.image_to_string(Image.fromarray(array))
+
+
+class RapidOcrBackend:
+    """RapidOCR: the PP-OCR models run on ONNXRuntime (stable, bounded memory)."""
+
+    def __init__(self, use_gpu: bool = False, cpu_threads: int | None = None):
+        from rapidocr_onnxruntime import RapidOCR
+
+        self._engine = RapidOCR()
+
+    def ocr_text(self, array: np.ndarray) -> str:
+        result, _elapse = self._engine(array)
+        if not result:
+            return ""
+        # RapidOCR yields [box, text, score] triples; keep the text field.
+        return "\n".join(line[1] for line in result if len(line) > 1)
+
+
+def build_backend(
+    engine: str, use_gpu: bool = False, cpu_threads: int | None = None
+):
+    """Instantiate the OCR backend for the given engine identifier."""
+    if engine == ENGINE_TESSERACT:
+        return TesseractBackend(use_gpu=use_gpu, cpu_threads=cpu_threads)
+    if engine == ENGINE_RAPIDOCR:
+        return RapidOcrBackend(use_gpu=use_gpu, cpu_threads=cpu_threads)
+    return PaddleBackend(use_gpu=use_gpu, cpu_threads=cpu_threads)
+
+
+def engine_uses_gpu(engine: str) -> bool:
+    """True only when the selected engine can actually use a CUDA GPU here.
+
+    Only the PaddlePaddle build is probed for CUDA; the Tesseract and RapidOCR
+    backends shipped here run on the CPU.
+    """
+    return engine == ENGINE_PADDLE and gpu_available()
+
+
 def _safe_render(path: str) -> tuple[np.ndarray | None, str | None]:
     """Render a front page for the batching pipeline, capturing any error."""
     try:
@@ -194,47 +280,78 @@ def _safe_render(path: str) -> tuple[np.ndarray | None, str | None]:
         return None, str(exc)
 
 
-# Per-process PaddleOCR engine, lazily created inside each executor worker.
-_WORKER_ENGINE = None
+# Per-process OCR backend, lazily created inside each executor worker, plus the
+# engine id it was built for (so a worker recycled without the initializer can
+# rebuild the right backend).
+_WORKER_BACKEND = None
+_WORKER_ENGINE_ID = DEFAULT_ENGINE
 
 
-def _executor_init() -> None:
-    """ProcessPoolExecutor initializer: build one engine per worker process."""
-    global _WORKER_ENGINE
+def _executor_init(engine: str) -> None:
+    """Worker initializer: record the engine and pin math threads.
+
+    The backend itself is built lazily on the first task (see ``_executor_ocr``)
+    rather than here, so a backend that fails to construct surfaces as a per-file
+    error instead of an initializer exception that could stall the pool.
+    """
+    global _WORKER_ENGINE_ID
+    _WORKER_ENGINE_ID = engine
     _pin_cpu_threads(1)
-    _WORKER_ENGINE = _build_paddle_engine(use_gpu=False, cpu_threads=1)
 
 
 def _executor_ocr(path: str) -> tuple[str, str | None, str | None]:
     """Render + OCR one PDF inside a worker process. Returns (path, text, error)."""
-    global _WORKER_ENGINE
+    global _WORKER_BACKEND
     try:
-        if _WORKER_ENGINE is None:  # spawn without initializer, or init failed
+        if _WORKER_BACKEND is None:  # first task in this (possibly recycled) worker
             _pin_cpu_threads(1)
-            _WORKER_ENGINE = _build_paddle_engine(use_gpu=False, cpu_threads=1)
+            _WORKER_BACKEND = build_backend(
+                _WORKER_ENGINE_ID, use_gpu=False, cpu_threads=1
+            )
         array = render_front_page_array(path)
-        result = _WORKER_ENGINE.ocr(array, cls=True)
-        return path, "\n".join(texts_from_paddle_result(result)), None
+        return path, _WORKER_BACKEND.ocr_text(array), None
     except Exception as exc:  # noqa: BLE001 - surfaced as a per-file failure
         return path, None, str(exc)
+
+
+# Cached batching backend, reused across searches. Building an OCR engine is
+# expensive, so keep a single instance keyed by (engine, gpu) and rebuild it only
+# when that key changes. (PaddleOCR on CPU is routed to the process pool instead
+# of this path precisely because its memory cannot be reclaimed in-process.)
+_BATCH_BACKEND = None
+_BATCH_BACKEND_KEY: tuple[str, bool] | None = None
+
+
+def _get_batch_backend(engine: str, use_gpu: bool):
+    """Return a shared OCR backend, building it once per (engine, gpu) key."""
+    global _BATCH_BACKEND, _BATCH_BACKEND_KEY
+    key = (engine, use_gpu)
+    if _BATCH_BACKEND is None or _BATCH_BACKEND_KEY != key:
+        _BATCH_BACKEND = build_backend(engine, use_gpu=use_gpu)
+        _BATCH_BACKEND_KEY = key
+    return _BATCH_BACKEND
 
 
 class GpuBatchStrategy:
     """Single engine fed by a batch of pre-rendered pages.
 
-    PaddleOCR's high-level ``ocr()`` does not batch full-page detection, so the
-    speed-up here comes from (a) running detection/recognition on the GPU and
-    (b) overlapping page rendering across threads while the engine works. If no
-    CUDA-capable PaddlePaddle build is present this transparently runs on the
-    CPU (the caller can surface that via :func:`gpu_available`).
+    The speed-up here comes from overlapping page rendering across threads while
+    the engine works (and, for a CUDA-capable PaddlePaddle build, running
+    detection/recognition on the GPU). Any of the OCR backends can be used.
     """
 
-    def __init__(self, batch_size: int = OCR_BATCH_SIZE, render_workers: int = RENDER_WORKERS):
+    def __init__(
+        self,
+        engine: str = DEFAULT_ENGINE,
+        batch_size: int = OCR_BATCH_SIZE,
+        render_workers: int = RENDER_WORKERS,
+    ):
+        self._engine = engine
         self._batch_size = batch_size
         self._render_workers = render_workers
 
     def process(self, files, stop_check):
-        engine = _build_paddle_engine(use_gpu=gpu_available())
+        use_gpu = engine_uses_gpu(self._engine)
         with ThreadPoolExecutor(max_workers=self._render_workers) as renderer:
             for start in range(0, len(files), self._batch_size):
                 if stop_check():
@@ -247,49 +364,76 @@ class GpuBatchStrategy:
                     if err is not None:
                         yield path, None, err
                         continue
+                    backend = _get_batch_backend(self._engine, use_gpu)
                     try:
-                        result = engine.ocr(array, cls=True)
-                        text = "\n".join(texts_from_paddle_result(result))
+                        text = backend.ocr_text(array)
                     except Exception as exc:  # noqa: BLE001 - per-file failure
                         yield path, None, str(exc)
                         continue
+                    finally:
+                        # Drop the rendered page as soon as OCR is done with it.
+                        del array
                     yield path, text, None
+                del rendered
 
 
 class ExecutorStrategy:
     """OCR across a pool of worker processes, each with its own engine."""
 
-    def __init__(self, max_workers: int = DEFAULT_MAX_WORKERS):
+    def __init__(self, engine: str = DEFAULT_ENGINE, max_workers: int = DEFAULT_MAX_WORKERS):
+        self._engine = engine
         self._max_workers = max(1, max_workers)
 
     def process(self, files, stop_check):
-        pool = ProcessPoolExecutor(
-            max_workers=self._max_workers, initializer=_executor_init
-        )
-        try:
-            futures = {pool.submit(_executor_ocr, path): path for path in files}
-            for future in as_completed(futures):
-                if stop_check():
-                    return
-                try:
-                    path, text, err = future.result()
-                except BrokenProcessPool:
-                    # A broken pool is unrecoverable (e.g. engine init crashed),
-                    # so let the worker treat it as a fatal error.
-                    raise
-                except Exception as exc:  # noqa: BLE001 - per-file failure
-                    yield futures[future], None, str(exc)
-                    continue
-                yield path, text, err
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        # Process in finite chunks, tearing the pool down between them. That
+        # reclaims PaddleOCR's leaked native memory without relying on
+        # ``max_tasks_per_child``, which on Windows often breaks the pool after
+        # the first generation of workers and silently aborts the rest.
+        chunk_size = self._max_workers * EXECUTOR_PAGES_PER_WORKER
+        for start in range(0, len(files), chunk_size):
+            if stop_check():
+                return
+            chunk = files[start : start + chunk_size]
+            pool = ProcessPoolExecutor(
+                max_workers=self._max_workers,
+                initializer=_executor_init,
+                initargs=(self._engine,),
+            )
+            try:
+                futures = {pool.submit(_executor_ocr, path): path for path in chunk}
+                for future in as_completed(futures):
+                    if stop_check():
+                        return
+                    try:
+                        path, text, err = future.result()
+                    except BrokenProcessPool:
+                        # A broken pool is unrecoverable (e.g. engine init crashed),
+                        # so let the worker treat it as a fatal error.
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - per-file failure
+                        yield futures[future], None, str(exc)
+                        continue
+                    yield path, text, err
+            finally:
+                # Wait for workers to exit so the OS reclaims each worker's OCR
+                # engine before the next chunk spins up a fresh pool.
+                pool.shutdown(wait=True, cancel_futures=True)
 
 
-def make_strategy(concurrency: str):
-    """Return an OCR strategy for the given concurrency identifier."""
+def make_strategy(concurrency: str, engine: str = DEFAULT_ENGINE):
+    """Return an OCR strategy for the given concurrency + engine identifiers.
+
+    PaddleOCR on CPU cannot release its process-global native memory (rebuilding
+    the engine in-place does not return the allocator/oneDNN arenas to the OS, so
+    RSS only grows), so single-engine batching is forced onto the process pool,
+    whose recycled workers actually reclaim memory by exiting. Tesseract and
+    RapidOCR have stable memory, so their in-process batch path is kept.
+    """
     if concurrency == CONCURRENCY_EXECUTOR:
-        return ExecutorStrategy()
-    return GpuBatchStrategy()
+        return ExecutorStrategy(engine)
+    if engine == ENGINE_PADDLE and not gpu_available():
+        return ExecutorStrategy(engine)
+    return GpuBatchStrategy(engine)
 
 
 class SearchWorker(QObject):
@@ -310,6 +454,7 @@ class SearchWorker(QObject):
         text_dir: str,
         text_cache: dict[str, str],
         concurrency: str = DEFAULT_CONCURRENCY,
+        engine: str = DEFAULT_ENGINE,
     ):
         super().__init__()
         self._files = files
@@ -318,6 +463,7 @@ class SearchWorker(QObject):
         self._text_dir = text_dir
         self._text_cache = text_cache
         self._concurrency = concurrency
+        self._engine = engine
         self._stop = False
 
     def stop(self) -> None:
@@ -349,6 +495,21 @@ class SearchWorker(QObject):
         except OSError as exc:  # non-fatal: caching is best-effort
             self.failed.emit(path, f"Could not cache OCR text: {exc}")
 
+    def _strategy_status(self) -> str:
+        """Human-readable note about which engine + execution path will run."""
+        engine_names = {
+            ENGINE_PADDLE: "PaddleOCR",
+            ENGINE_TESSERACT: "Tesseract",
+            ENGINE_RAPIDOCR: "RapidOCR",
+        }
+        engine_name = engine_names.get(self._engine, self._engine)
+        if self._engine == ENGINE_PADDLE and gpu_available():
+            return f"{engine_name} \u2014 GPU batching on CUDA"
+        strategy = make_strategy(self._concurrency, self._engine)
+        if isinstance(strategy, ExecutorStrategy):
+            return f"{engine_name} \u2014 process pool ({DEFAULT_MAX_WORKERS} workers)"
+        return f"{engine_name} \u2014 in-process batching"
+
     def run(self) -> None:
         total = len(self._files)
         done = 0
@@ -373,14 +534,8 @@ class SearchWorker(QObject):
         # Second pass: OCR the remaining files with the chosen concurrency
         # strategy, storing/searching each result as it streams back.
         if not self._stop and uncached:
-            if self._concurrency == CONCURRENCY_GPU_BATCH:
-                if gpu_available():
-                    self.status.emit("GPU Batching \u2014 using CUDA GPU")
-                else:
-                    self.status.emit(
-                        "GPU Batching \u2014 no CUDA GPU detected, running on CPU"
-                    )
-            strategy = make_strategy(self._concurrency)
+            self.status.emit(self._strategy_status())
+            strategy = make_strategy(self._concurrency, self._engine)
             try:
                 for path, text, err in strategy.process(uncached, lambda: self._stop):
                     if err is not None:
@@ -420,6 +575,9 @@ class MainWindow(QMainWindow):
         )
         if self.concurrency not in (CONCURRENCY_GPU_BATCH, CONCURRENCY_EXECUTOR):
             self.concurrency = DEFAULT_CONCURRENCY
+        self.engine = self.settings.value("engine", DEFAULT_ENGINE, type=str)
+        if self.engine not in VALID_ENGINES:
+            self.engine = DEFAULT_ENGINE
 
         self._build_ui()
         self._build_menu()
@@ -503,6 +661,22 @@ class MainWindow(QMainWindow):
             self.concurrency_group.addAction(action)
             concurrency_menu.addAction(action)
 
+        engine_menu = menubar.addMenu("OCR &Engine")
+        self.engine_group = QActionGroup(self)
+        self.engine_group.setExclusive(True)
+        engine_options = (
+            ("PaddleOCR", ENGINE_PADDLE),
+            ("Tesseract", ENGINE_TESSERACT),
+            ("RapidOCR", ENGINE_RAPIDOCR),
+        )
+        for label, value in engine_options:
+            action = QAction(label, self, checkable=True)
+            action.setData(value)
+            action.setChecked(value == self.engine)
+            action.triggered.connect(self._on_engine_changed)
+            self.engine_group.addAction(action)
+            engine_menu.addAction(action)
+
     # ------------------------------------------------------------- folder load
     def select_folder(self) -> None:
         from PyQt6.QtWidgets import QFileDialog
@@ -568,7 +742,9 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.thread = QThread(self)
+        # Unparented so it isn't kept alive as a child of MainWindow; teardown
+        # releases it explicitly via deleteLater.
+        self.thread = QThread()
         self.worker = SearchWorker(
             list(self.pdf_paths),
             term,
@@ -576,6 +752,7 @@ class MainWindow(QMainWindow):
             text_dir,
             self.text_cache,
             self.concurrency,
+            self.engine,
         )
         self.worker.moveToThread(self.thread)
 
@@ -604,6 +781,14 @@ class MainWindow(QMainWindow):
         self.concurrency = action.data()
         self.settings.setValue("concurrency", self.concurrency)
         self.statusBar().showMessage(f"Concurrency: {action.text()}")
+
+    def _on_engine_changed(self) -> None:
+        action = self.engine_group.checkedAction()
+        if action is None:
+            return
+        self.engine = action.data()
+        self.settings.setValue("engine", self.engine)
+        self.statusBar().showMessage(f"OCR engine: {action.text()}")
 
     # ---------------------------------------------------------- worker signals
     def _on_match_found(self, path: str) -> None:
@@ -637,6 +822,9 @@ class MainWindow(QMainWindow):
         if self.thread is not None:
             self.thread.quit()
             self.thread.wait()
+            self.thread.deleteLater()
+        if self.worker is not None:
+            self.worker.deleteLater()
         self.thread = None
         self.worker = None
         self.term_action.setEnabled(True)

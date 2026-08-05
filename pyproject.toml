@@ -14,6 +14,11 @@ dependencies = [
     "Pillow>=10.0",
     # paddlepaddle imports setuptools at runtime but does not declare it.
     "setuptools>=68",
+    # Alternative OCR engines selectable from the "OCR Engine" menu. RapidOCR
+    # runs the PP-OCR models on ONNXRuntime (stable memory); pytesseract also
+    # needs the external Tesseract binary installed on the system.
+    "rapidocr-onnxruntime>=1.3",
+    "pytesseract>=0.3.10",
 ]
 
 # No [build-system] on purpose: uv treats this as a non-packaged (virtual)
